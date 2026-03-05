@@ -132,7 +132,7 @@ function colorDistance(r1, g1, b1, r2, g2, b2) {
  * @param {number} tolerance - Farbtoleranz (Standard: 30)
  * @returns {Promise<Buffer>} - PNG mit transparentem Hintergrund
  */
-async function extractDesign(baseBuffer, compositeBuffer, tolerance = 2) {
+async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   // Beide Bilder laden und auf gleiche Größe bringen und in JPG konvertieren
 
   
@@ -450,7 +450,7 @@ for (let c = 0; c < components.length; c++) {
 // ========== MAIN FUNCTION (Name bleibt gleich) ==========
 // Änderung: erwartet jetzt zusätzlich baseMockupBuffer und nutzt extractDesign statt Grid-Removal
 async function removeGridBackgroundAdvanced(compositeBuffer, baseMockupBuffer) {
-  return extractDesign(baseMockupBuffer, compositeBuffer, 30);
+  return extractDesign(baseMockupBuffer, compositeBuffer, 10);
 }
 
 // --------------------- Preview-Erstellung ---------------------
