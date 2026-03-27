@@ -93,7 +93,7 @@ app.get("/generic-preview", async (req, res) => {
 
   const cacheKey = `GENERIC_${artworkUrl}_${baseMockupUrl}_${targetMockupUrl}_${printX}_${printY}_${printW}_${printH}`;
   if (previewCache.has(cacheKey)) {
-    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Type", "image/jpeg");
     return res.send(previewCache.get(cacheKey));
   }
 
@@ -109,7 +109,7 @@ app.get("/generic-preview", async (req, res) => {
     });
 
     previewCache.set(cacheKey, finalBuffer);
-    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Type", "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=3600");
     res.send(finalBuffer);
   } catch (err) {
@@ -157,7 +157,7 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
 
     const cacheKey = `LEGACY_${path}_${artworkUrl}_${baseMockupUrl}`;
     if (previewCache.has(cacheKey)) {
-      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Content-Type", "image/jpeg");
       return res.send(previewCache.get(cacheKey));
     }
 
@@ -173,7 +173,7 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
       });
 
       previewCache.set(cacheKey, finalBuffer);
-      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Content-Type", "image/jpeg");
       res.send(finalBuffer);
     } catch (err) {
       console.error(`Fehler in ${path}:`, err);
@@ -439,10 +439,10 @@ async function makePreview({
   const centeredLeft = areaLeft + Math.round((areaPixelW - scaledMeta.width) / 2);
   const centeredTop = areaTop + Math.round((areaPixelH - scaledMeta.height) / 2);
 
-  // 5. Design auf Ziel-Mockup compositen
+   // 5. Design auf Ziel-Mockup compositen
   const finalBuf = await targetSharp
     .composite([{ input: scaled, left: centeredLeft, top: centeredTop }])
-    .png()
+    .jpeg({ quality: 90 })
     .toBuffer();
 
   return finalBuf;
