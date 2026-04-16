@@ -44,7 +44,6 @@ app.get("/debug-design", async (req, res) => {
   }
 
   try {
-    // FIX 1: Parallel laden statt nacheinander
     const [compositeBuffer, baseBuffer] = await Promise.all([
       loadImage(artworkUrl),
       loadImage(baseMockupUrl),
@@ -198,7 +197,7 @@ function colorDistance(r1, g1, b1, r2, g2, b2) {
 async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   const t0 = Date.now();
 
-  // Phase 0: JPG-Konvertierung (Transparenz entfernen)
+  // Phase 0: JPG-Konvertierung — parallel
   [baseBuffer, compositeBuffer] = await Promise.all([
     sharp(baseBuffer).flatten({ background: { r: 255, g: 255, b: 255 } }).jpeg({ quality: 100 }).toBuffer(),
     sharp(compositeBuffer).flatten({ background: { r: 255, g: 255, b: 255 } }).jpeg({ quality: 100 }).toBuffer(),
@@ -206,19 +205,16 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
 
   const baseMeta = await sharp(baseBuffer).metadata();
   const compMeta = await sharp(compositeBuffer).metadata();
-
   const width = baseMeta.width;
   const height = baseMeta.height;
 
-  // FIX 1: Raw-Pixel parallel laden
+  // Raw-Pixel parallel laden
   const [baseRaw, compRaw] = await Promise.all([
     sharp(baseBuffer).ensureAlpha().raw().toBuffer(),
     (async () => {
-      let compSharp = sharp(compositeBuffer).ensureAlpha();
-      if (compMeta.width !== width || compMeta.height !== height) {
-        compSharp = compSharp.resize(width, height);
-      }
-      return compSharp.raw().toBuffer();
+      let s = sharp(compositeBuffer).ensureAlpha();
+      if (compMeta.width !== width || compMeta.height !== height) s = s.resize(width, height);
+      return s.raw().toBuffer();
     })(),
   ]);
 
@@ -296,7 +292,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     const queue = [i]; const pixels = []; visited[i] = 1;
     while (queue.length > 0) {
       const cur = queue.pop(); pixels.push(cur);
-      const cx = cur % width, cy = (cur-cx) / width;
+      const cx = cur % width, cy = Math.floor(cur / width);
       for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++) {
         if (dx===0 && dy===0) continue;
         const nx=cx+dx, ny=cy+dy;
@@ -322,7 +318,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     if (comp.pixels.length >= sizeThreshold) continue;
     let cMinX=width, cMaxX=0, cMinY=height, cMaxY=0;
     for (const pi of comp.pixels) {
-      const px=pi%width, py=(pi-px)/width;
+      const px=pi%width, py=Math.floor(pi/width);
       if(px<cMinX) cMinX=px; if(px>cMaxX) cMaxX=px;
       if(py<cMinY) cMinY=py; if(py>cMaxY) cMaxY=py;
     }
@@ -337,49 +333,69 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   const t4 = Date.now();
 
   // ============================================================================
-  // Phase 4.1: Proximity-Filter — OPTIMIERT mit Bounding-Box
+  // Phase 4.1: Proximity-Filter — DILATION MASK (pixelgenau + schnell)
   //
-  // Vorher: für jeden Fremdpixel wurden bis zu 32.400 Pixel einzeln geprüft
-  // Nachher: Bounding-Box des Haupt-Clusters vorberechnen, dann nur
-  //          4 Zahlenvergleiche pro Fremd-Cluster (statt Pixel-Loop)
+  // Problem mit Original:   für jeden Fremdpixel 32.400 Pixel scannen → langsam
+  // Problem mit Bbox-Fix:   T-Shirt-Umriss umschließt Design → Abstand = 0 → bleibt fälschlicherweise
+  //
+  // Diese Lösung baut einmalig eine "Dilation Mask":
+  //   Alle Pixel die innerhalb von 90px eines Haupt-Cluster-Pixels liegen werden markiert.
+  //   Danach: jede Fremdpixel-Prüfung = ein Array-Zugriff, O(1).
+  //
+  // Algorithmus (zwei Prefix-Summen-Pässe, O(width × height)):
+  //   Pass 1 horizontal: für jede Zeile, markiere alle Pixel ±90px von einem Haupt-Pixel
+  //   Pass 2 vertikal:   für jede Spalte, markiere alle Pixel ±90px von einem h-dilated Pixel
+  //   Ergebnis: quadratische Dilation, semantisch identisch zum Original (±90px in jede Richtung)
+  //
+  // T-Shirt-Umriss: seine Pixel liegen am Rand, weit vom Design → nicht in der Maske → entfernt ✓
+  // "EST.", "9990": nah am Design → in der Maske → bleiben ✓
+  // Laufzeit: ~490.000 Ops statt ~162.000.000 Ops beim Original → ~300× schneller
   // ============================================================================
 
-  // Bounding-Box des Haupt-Clusters vorberechnen
   const proximityRadius = 90;
-  let mainMinX = width, mainMaxX = 0, mainMinY = height, mainMaxY = 0;
 
+  // Schritt 1: Binäre Maske der Haupt-Cluster-Pixel
+  const mainMask = new Uint8Array(totalPixels);
   if (components.length > 0) {
-    for (const pi of components[largestIdx].pixels) {
-      const px = pi % width;
-      const py = (pi - px) / width;
-      if (px < mainMinX) mainMinX = px;
-      if (px > mainMaxX) mainMaxX = px;
-      if (py < mainMinY) mainMinY = py;
-      if (py > mainMaxY) mainMaxY = py;
+    for (const pi of components[largestIdx].pixels) mainMask[pi] = 1;
+  }
+
+  // Schritt 2: Horizontale Dilation via Prefix-Summen
+  const hDilated = new Uint8Array(totalPixels);
+  const rowPrefix = new Int32Array(width + 1);
+  for (let y = 0; y < height; y++) {
+    const rowBase = y * width;
+    rowPrefix[0] = 0;
+    for (let x = 0; x < width; x++) {
+      rowPrefix[x + 1] = rowPrefix[x] + mainMask[rowBase + x];
+    }
+    for (let x = 0; x < width; x++) {
+      const lo = Math.max(0, x - proximityRadius);
+      const hi = Math.min(width - 1, x + proximityRadius);
+      if (rowPrefix[hi + 1] - rowPrefix[lo] > 0) hDilated[rowBase + x] = 1;
     }
   }
 
+  // Schritt 3: Vertikale Dilation via Prefix-Summen
+  const dilationMask = new Uint8Array(totalPixels);
+  const colPrefix = new Int32Array(height + 1);
+  for (let x = 0; x < width; x++) {
+    colPrefix[0] = 0;
+    for (let y = 0; y < height; y++) {
+      colPrefix[y + 1] = colPrefix[y] + hDilated[y * width + x];
+    }
+    for (let y = 0; y < height; y++) {
+      const lo = Math.max(0, y - proximityRadius);
+      const hi = Math.min(height - 1, y + proximityRadius);
+      if (colPrefix[hi + 1] - colPrefix[lo] > 0) dilationMask[y * width + x] = 1;
+    }
+  }
+
+  // Schritt 4: Fremd-Cluster entfernen wenn keiner ihrer Pixel in der Maske liegt
   for (let c = 0; c < components.length; c++) {
     if (c === largestIdx) continue;
     const comp = components[c];
-
-    // Bounding-Box dieses Fremd-Clusters berechnen
-    let cMinX = width, cMaxX = 0, cMinY = height, cMaxY = 0;
-    for (const pi of comp.pixels) {
-      const px = pi % width;
-      const py = (pi - px) / width;
-      if (px < cMinX) cMinX = px;
-      if (px > cMaxX) cMaxX = px;
-      if (py < cMinY) cMinY = py;
-      if (py > cMaxY) cMaxY = py;
-    }
-
-    // Exakter minimaler Abstand zwischen den zwei Rechtecken (Pythagoras)
-    // dx/dy = 0 wenn sie sich überlappen, sonst die Lücke zwischen ihnen
-    const dx = Math.max(0, Math.max(cMinX - mainMaxX, mainMinX - cMaxX));
-    const dy = Math.max(0, Math.max(cMinY - mainMaxY, mainMinY - cMaxY));
-    const isNearMain = Math.sqrt(dx*dx + dy*dy) <= proximityRadius;
-
+    const isNearMain = comp.pixels.some(pi => dilationMask[pi] === 1);
     if (!isNearMain) {
       for (const pi of comp.pixels) {
         outRaw[pi*4] = 0; outRaw[pi*4+1] = 0; outRaw[pi*4+2] = 0; outRaw[pi*4+3] = 0;
@@ -387,7 +403,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     }
   }
 
-  console.log(`[Timing] Phase 4.1 (Proximity-Filter OPTIMIERT): ${Date.now() - t4}ms`);
+  console.log(`[Timing] Phase 4.1 (Proximity Dilation Mask): ${Date.now() - t4}ms`);
   const t5 = Date.now();
 
   // Phase 4.5: Restaurierungs-Pass
@@ -439,15 +455,14 @@ async function makePreview({
 }) {
   const t0 = Date.now();
 
-  // FIX 1: Alle 3 Bilder parallel laden statt nacheinander
-  // Vorher: ~2-3s (sequentiell), Nachher: ~0.8-1s (parallel)
+  // Alle 3 Bilder parallel laden
   const [artBuf, baseBuf, targetBuf] = await Promise.all([
     loadImage(artworkUrl),
     loadImage(baseMockupUrl),
     loadImage(targetMockupUrl),
   ]);
 
-  console.log(`[Timing] Bildladefung (parallel): ${Date.now() - t0}ms`);
+  console.log(`[Timing] Bildladung (parallel): ${Date.now() - t0}ms`);
 
   // Design extrahieren (mit Cache — gleiches Design wird nur 1x extrahiert)
   const designCacheKey = `${artworkUrl}__${baseMockupUrl}`;
@@ -479,10 +494,7 @@ async function makePreview({
   const areaTop = Math.round(meta.height * printY);
 
   const scaled = await sharp(designTransparent)
-    .resize(areaPixelW, areaPixelH, {
-      fit: "inside",
-      withoutEnlargement: false,
-    })
+    .resize(areaPixelW, areaPixelH, { fit: "inside", withoutEnlargement: false })
     .png()
     .toBuffer();
 
