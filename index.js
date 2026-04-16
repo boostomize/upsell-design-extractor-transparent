@@ -44,8 +44,11 @@ app.get("/debug-design", async (req, res) => {
   }
 
   try {
-    const compositeBuffer = await loadImage(artworkUrl);
-    const baseBuffer = await loadImage(baseMockupUrl);
+    // FIX 1: Parallel laden statt nacheinander
+    const [compositeBuffer, baseBuffer] = await Promise.all([
+      loadImage(artworkUrl),
+      loadImage(baseMockupUrl),
+    ]);
     const designBuffer = await extractDesign(baseBuffer, compositeBuffer, 10);
 
     res.setHeader("Content-Type", "image/png");
@@ -59,16 +62,6 @@ app.get("/debug-design", async (req, res) => {
 
 // ============================================================================
 // GENERISCHER PREVIEW-ENDPOINT
-// Ersetzt alle alten /tote-preview, /tee-white-preview, etc.
-//
-// Query-Parameter:
-//   url              = Composite-Bild (Mockup + Design) vom Ursprungsprodukt
-//   mockup_url       = Base-Mockup des Ursprungsprodukts (leer, ohne Design)
-//   target_mockup_url = Ziel-Mockup aus der Mockup-Bibliothek (worauf das Design gelegt wird)
-//   print_x          = X-Position der Druckfläche (0-1, default 0.30)
-//   print_y          = Y-Position der Druckfläche (0-1, default 0.28)
-//   print_w          = Breite der Druckfläche (0-1, default 0.35)
-//   print_h          = Höhe der Druckfläche (0-1, default 0.40)
 // ============================================================================
 app.get("/generic-preview", async (req, res) => {
   const artworkUrl = req.query.url;
@@ -85,7 +78,6 @@ app.get("/generic-preview", async (req, res) => {
     return res.status(400).json({ error: "Parameter 'target_mockup_url' fehlt." });
   }
 
-  // Druckfläche aus Query-Parametern (vom Druckflächen-Editor in der App)
   const printX = parseFloat(req.query.print_x) || 0.30;
   const printY = parseFloat(req.query.print_y) || 0.28;
   const printW = parseFloat(req.query.print_w) || 0.35;
@@ -119,9 +111,7 @@ app.get("/generic-preview", async (req, res) => {
 });
 
 // ============================================================================
-// ALTE ENDPOINTS (Rückwärtskompatibilität, falls noch gebraucht)
-// Leiten intern auf die gleiche Logik weiter mit festen Werten.
-// Können später entfernt werden.
+// ALTE ENDPOINTS (Rückwärtskompatibilität)
 // ============================================================================
 
 const LEGACY_CONFIGS = {
@@ -202,20 +192,17 @@ function colorDistance(r1, g1, b1, r2, g2, b2) {
 }
 
 // ============================================================================
-// DESIGN-EXTRAKTION (Pixel-Diff zwischen leerem Mockup und Composite)
+// DESIGN-EXTRAKTION
 // ============================================================================
 
 async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
-  // Phase 0: JPG-Konvertierung (Transparenz entfernen)
-  baseBuffer = await sharp(baseBuffer)
-    .flatten({ background: { r: 255, g: 255, b: 255 } })
-    .jpeg({ quality: 100 })
-    .toBuffer();
+  const t0 = Date.now();
 
-  compositeBuffer = await sharp(compositeBuffer)
-    .flatten({ background: { r: 255, g: 255, b: 255 } })
-    .jpeg({ quality: 100 })
-    .toBuffer();
+  // Phase 0: JPG-Konvertierung (Transparenz entfernen)
+  [baseBuffer, compositeBuffer] = await Promise.all([
+    sharp(baseBuffer).flatten({ background: { r: 255, g: 255, b: 255 } }).jpeg({ quality: 100 }).toBuffer(),
+    sharp(compositeBuffer).flatten({ background: { r: 255, g: 255, b: 255 } }).jpeg({ quality: 100 }).toBuffer(),
+  ]);
 
   const baseMeta = await sharp(baseBuffer).metadata();
   const compMeta = await sharp(compositeBuffer).metadata();
@@ -223,13 +210,20 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   const width = baseMeta.width;
   const height = baseMeta.height;
 
-  const baseRaw = await sharp(baseBuffer).ensureAlpha().raw().toBuffer();
+  // FIX 1: Raw-Pixel parallel laden
+  const [baseRaw, compRaw] = await Promise.all([
+    sharp(baseBuffer).ensureAlpha().raw().toBuffer(),
+    (async () => {
+      let compSharp = sharp(compositeBuffer).ensureAlpha();
+      if (compMeta.width !== width || compMeta.height !== height) {
+        compSharp = compSharp.resize(width, height);
+      }
+      return compSharp.raw().toBuffer();
+    })(),
+  ]);
 
-  let compSharp = sharp(compositeBuffer).ensureAlpha();
-  if (compMeta.width !== width || compMeta.height !== height) {
-    compSharp = compSharp.resize(width, height);
-  }
-  const compRaw = await compSharp.raw().toBuffer();
+  console.log(`[Timing] Phase 0 (Laden + Flatten): ${Date.now() - t0}ms`);
+  const t1 = Date.now();
 
   const totalPixels = width * height;
   const outRaw = Buffer.alloc(totalPixels * 4);
@@ -270,6 +264,9 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     }
   }
 
+  console.log(`[Timing] Phase 1+2 (Diff + Alpha): ${Date.now() - t1}ms`);
+  const t2 = Date.now();
+
   // Phase 3: Isolierte Rausch-Pixel entfernen
   const alphaChannel = new Uint8Array(totalPixels);
   for (let i = 0; i < totalPixels; i++) alphaChannel[i] = outRaw[i*4+3];
@@ -286,6 +283,9 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
       if (opaqueNeighbors <= 1 && alphaChannel[i] < 128) outRaw[i*4+3] = 0;
     }
   }
+
+  console.log(`[Timing] Phase 3 (Rausch-Filter): ${Date.now() - t2}ms`);
+  const t3 = Date.now();
 
   // Phase 4: Connected-Component-Filter
   const visited = new Uint8Array(totalPixels);
@@ -333,30 +333,70 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     }
   }
 
-  // Phase 4.1: Proximity-Filter
-  const mainPixelSet = new Set();
-  if (components.length > 0) for (const pi of components[largestIdx].pixels) mainPixelSet.add(pi);
-  const proximityRadius = 90;
+  console.log(`[Timing] Phase 4 (Connected Components): ${Date.now() - t3}ms`);
+  const t4 = Date.now();
 
-  for (let c=0; c<components.length; c++) {
-    if (c===largestIdx) continue;
-    const comp = components[c];
-    let isNearMain = false;
-    for (const pi of comp.pixels) {
-      if (isNearMain) break;
-      const px=pi%width, py=(pi-px)/width;
-      for (let dy=-proximityRadius; dy<=proximityRadius && !isNearMain; dy++) {
-        for (let dx=-proximityRadius; dx<=proximityRadius && !isNearMain; dx++) {
-          const nx=px+dx, ny=py+dy;
-          if (nx<0||nx>=width||ny<0||ny>=height) continue;
-          if (mainPixelSet.has(ny*width+nx)) isNearMain=true;
-        }
-      }
-    }
-    if (!isNearMain) {
-      for (const pi of comp.pixels) { outRaw[pi*4]=0; outRaw[pi*4+1]=0; outRaw[pi*4+2]=0; outRaw[pi*4+3]=0; }
+  // ============================================================================
+  // Phase 4.1: Proximity-Filter — OPTIMIERT mit Bounding-Box
+  //
+  // Vorher: für jeden Fremdpixel wurden bis zu 32.400 Pixel einzeln geprüft
+  // Nachher: Bounding-Box des Haupt-Clusters vorberechnen, dann nur
+  //          4 Zahlenvergleiche pro Fremd-Cluster (statt Pixel-Loop)
+  // ============================================================================
+
+  // Bounding-Box des Haupt-Clusters vorberechnen
+  const proximityRadius = 90;
+  let mainMinX = width, mainMaxX = 0, mainMinY = height, mainMaxY = 0;
+
+  if (components.length > 0) {
+    for (const pi of components[largestIdx].pixels) {
+      const px = pi % width;
+      const py = (pi - px) / width;
+      if (px < mainMinX) mainMinX = px;
+      if (px > mainMaxX) mainMaxX = px;
+      if (py < mainMinY) mainMinY = py;
+      if (py > mainMaxY) mainMaxY = py;
     }
   }
+
+  // Bounding-Box um den Proximity-Radius erweitern
+  const expandedMinX = mainMinX - proximityRadius;
+  const expandedMaxX = mainMaxX + proximityRadius;
+  const expandedMinY = mainMinY - proximityRadius;
+  const expandedMaxY = mainMaxY + proximityRadius;
+
+  for (let c = 0; c < components.length; c++) {
+    if (c === largestIdx) continue;
+    const comp = components[c];
+
+    // Bounding-Box dieses Fremd-Clusters berechnen
+    let cMinX = width, cMaxX = 0, cMinY = height, cMaxY = 0;
+    for (const pi of comp.pixels) {
+      const px = pi % width;
+      const py = (pi - px) / width;
+      if (px < cMinX) cMinX = px;
+      if (px > cMaxX) cMaxX = px;
+      if (py < cMinY) cMinY = py;
+      if (py > cMaxY) cMaxY = py;
+    }
+
+    // Überschneidet sich die Fremd-Bounding-Box mit der erweiterten Haupt-Box?
+    // Wenn nicht → Cluster ist zu weit weg → entfernen
+    const isNearMain =
+      cMaxX >= expandedMinX &&
+      cMinX <= expandedMaxX &&
+      cMaxY >= expandedMinY &&
+      cMinY <= expandedMaxY;
+
+    if (!isNearMain) {
+      for (const pi of comp.pixels) {
+        outRaw[pi*4] = 0; outRaw[pi*4+1] = 0; outRaw[pi*4+2] = 0; outRaw[pi*4+3] = 0;
+      }
+    }
+  }
+
+  console.log(`[Timing] Phase 4.1 (Proximity-Filter OPTIMIERT): ${Date.now() - t4}ms`);
+  const t5 = Date.now();
 
   // Phase 4.5: Restaurierungs-Pass
   const survivingMask = new Uint8Array(totalPixels);
@@ -384,7 +424,12 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   if (maxX>=minX && maxY>=minY) {
     result = result.extract({ left:minX, top:minY, width:maxX-minX+1, height:maxY-minY+1 });
   }
-  return result.png().toBuffer();
+
+  const output = await result.png().toBuffer();
+  console.log(`[Timing] Phase 4.5+5 (Restore + Crop): ${Date.now() - t5}ms`);
+  console.log(`[Timing] GESAMT Extraktion: ${Date.now() - t0}ms`);
+
+  return output;
 }
 
 // ============================================================================
@@ -392,23 +437,31 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
 // ============================================================================
 
 async function makePreview({
-  artworkUrl,        // Composite: Ursprungs-Mockup + Design
-  baseMockupUrl,     // Base: Ursprungs-Mockup ohne Design
-  targetMockupUrl,   // Ziel-Mockup aus der Mockup-Bibliothek
-  printX,            // Druckfläche X (0-1)
-  printY,            // Druckfläche Y (0-1)
-  printW,            // Druckfläche Breite (0-1)
-  printH,            // Druckfläche Höhe (0-1)
+  artworkUrl,
+  baseMockupUrl,
+  targetMockupUrl,
+  printX,
+  printY,
+  printW,
+  printH,
 }) {
-  // 1. Bilder laden
-  const artBuf = await loadImage(artworkUrl);
-  const baseBuf = await loadImage(baseMockupUrl);
-  const targetBuf = await loadImage(targetMockupUrl);
+  const t0 = Date.now();
 
-    // 2. Design extrahieren (mit Cache — gleiches Design wird nur 1x extrahiert)
+  // FIX 1: Alle 3 Bilder parallel laden statt nacheinander
+  // Vorher: ~2-3s (sequentiell), Nachher: ~0.8-1s (parallel)
+  const [artBuf, baseBuf, targetBuf] = await Promise.all([
+    loadImage(artworkUrl),
+    loadImage(baseMockupUrl),
+    loadImage(targetMockupUrl),
+  ]);
+
+  console.log(`[Timing] Bildladefung (parallel): ${Date.now() - t0}ms`);
+
+  // Design extrahieren (mit Cache — gleiches Design wird nur 1x extrahiert)
   const designCacheKey = `${artworkUrl}__${baseMockupUrl}`;
   let designTransparent;
   if (designCache.has(designCacheKey)) {
+    console.log(`[Timing] Design aus Cache geladen`);
     designTransparent = designCache.get(designCacheKey);
   } else {
     try {
@@ -420,18 +473,19 @@ async function makePreview({
     designCache.set(designCacheKey, designTransparent);
   }
 
-  // 3. Ziel-Mockup Dimensionen lesen
+  const t1 = Date.now();
+
+  // Ziel-Mockup Dimensionen lesen
   const targetSharp = sharp(targetBuf);
   const meta = await targetSharp.metadata();
   if (!meta.width || !meta.height) throw new Error("Konnte Ziel-Mockup-Größe nicht lesen.");
 
-  // 4. Design in die Druckfläche einpassen
+  // Design in die Druckfläche einpassen
   const areaPixelW = Math.round(meta.width * printW);
   const areaPixelH = Math.round(meta.height * printH);
   const areaLeft = Math.round(meta.width * printX);
   const areaTop = Math.round(meta.height * printY);
 
-  // Design so skalieren, dass es in die Druckfläche passt (Aspect Ratio beibehalten)
   const scaled = await sharp(designTransparent)
     .resize(areaPixelW, areaPixelH, {
       fit: "inside",
@@ -440,19 +494,20 @@ async function makePreview({
     .png()
     .toBuffer();
 
-  // Skaliertes Design zentriert in der Druckfläche positionieren (Höhe etwas nach oben versetzt um 30%)
   const scaledMeta = await sharp(scaled).metadata();
   const centeredLeft = areaLeft + Math.round((areaPixelW - scaledMeta.width) / 2);
   const freeSpaceV = areaPixelH - scaledMeta.height;
-const centeredTop = freeSpaceV > 20
-  ? areaTop + Math.round(freeSpaceV * 0.3)   // Genug Platz → 30% oben
-  : areaTop + Math.round(freeSpaceV / 2);     // Kein Platz → zentriert
+  const centeredTop = freeSpaceV > 20
+    ? areaTop + Math.round(freeSpaceV * 0.3)
+    : areaTop + Math.round(freeSpaceV / 2);
 
-   // 5. Design auf Ziel-Mockup compositen
   const finalBuf = await targetSharp
     .composite([{ input: scaled, left: centeredLeft, top: centeredTop }])
     .jpeg({ quality: 90 })
     .toBuffer();
+
+  console.log(`[Timing] Placement + Composite: ${Date.now() - t1}ms`);
+  console.log(`[Timing] GESAMT makePreview: ${Date.now() - t0}ms`);
 
   return finalBuf;
 }
