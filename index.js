@@ -359,12 +359,6 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     }
   }
 
-  // Bounding-Box um den Proximity-Radius erweitern
-  const expandedMinX = mainMinX - proximityRadius;
-  const expandedMaxX = mainMaxX + proximityRadius;
-  const expandedMinY = mainMinY - proximityRadius;
-  const expandedMaxY = mainMaxY + proximityRadius;
-
   for (let c = 0; c < components.length; c++) {
     if (c === largestIdx) continue;
     const comp = components[c];
@@ -380,13 +374,11 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
       if (py > cMaxY) cMaxY = py;
     }
 
-    // Überschneidet sich die Fremd-Bounding-Box mit der erweiterten Haupt-Box?
-    // Wenn nicht → Cluster ist zu weit weg → entfernen
-    const isNearMain =
-      cMaxX >= expandedMinX &&
-      cMinX <= expandedMaxX &&
-      cMaxY >= expandedMinY &&
-      cMinY <= expandedMaxY;
+    // Exakter minimaler Abstand zwischen den zwei Rechtecken (Pythagoras)
+    // dx/dy = 0 wenn sie sich überlappen, sonst die Lücke zwischen ihnen
+    const dx = Math.max(0, Math.max(cMinX - mainMaxX, mainMinX - cMaxX));
+    const dy = Math.max(0, Math.max(cMinY - mainMaxY, mainMinY - cMaxY));
+    const isNearMain = Math.sqrt(dx*dx + dy*dy) <= proximityRadius;
 
     if (!isNearMain) {
       for (const pi of comp.pixels) {
