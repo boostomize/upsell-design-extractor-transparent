@@ -489,7 +489,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   console.log(`[Timing] Phase 4 (Connected Components): ${Date.now() - t3}ms`);
   const t4 = Date.now();
 
-  const proximityRadius = 90;
+  const proximityRadius = 70;
   const mainMask = new Uint8Array(totalPixels);
   if (components.length > 0) for (const pi of components[largestIdx].pixels) mainMask[pi] = 1;
 
