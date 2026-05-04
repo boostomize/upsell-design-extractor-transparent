@@ -36,8 +36,10 @@ const r2 = new S3Client({
 const R2_BUCKET = process.env.R2_BUCKET;
 const IMG_BASE_URL = "https://img.boostomize.de";
 
-async function buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl) {
-  const data = new TextEncoder().encode(`${artworkUrl}|${baseMockupUrl}|${targetMockupUrl}`);
+// extraLayerUrls in Hash einbeziehen → unterschiedliche Cache-Einträge pro Layer-Kombination
+async function buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls = []) {
+  const raw = `${artworkUrl}|${baseMockupUrl}|${targetMockupUrl}|${extraLayerUrls.join(",")}`;
+  const data = new TextEncoder().encode(raw);
   const hashBuffer = await crypto.subtle.digest("SHA-1", data);
   return Array.from(new Uint8Array(hashBuffer))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -75,11 +77,14 @@ app.get("/", (req, res) => {
 
 // ============================================================================
 // DEBUG: Nur Design-Extraktion (ohne Placement)
-// /debug-design?url=COMPOSITE_URL&mockup_url=BASE_MOCKUP_URL
+// /debug-design?url=COMPOSITE_URL&mockup_url=BASE_MOCKUP_URL[&extra_layer_urls=URL1,URL2]
 // ============================================================================
 app.get("/debug-design", async (req, res) => {
   const artworkUrl = req.query.url;
   const baseMockupUrl = req.query.mockup_url;
+  const extraLayerUrls = req.query.extra_layer_urls
+    ? req.query.extra_layer_urls.split(",").map(s => s.trim()).filter(Boolean)
+    : [];
 
   if (!artworkUrl || typeof artworkUrl !== "string") {
     return res.status(400).json({ error: "Parameter 'url' fehlt." });
@@ -93,7 +98,11 @@ app.get("/debug-design", async (req, res) => {
       loadImage(artworkUrl),
       loadImage(baseMockupUrl),
     ]);
-    const designBuffer = await extractDesign(baseBuffer, compositeBuffer, 10);
+
+    // Extra-Layer auf die Basis compositen bevor der Diff läuft
+    const baseWithLayers = await compositeLayersOntoBase(baseBuffer, extraLayerUrls);
+
+    const designBuffer = await extractDesign(baseWithLayers, compositeBuffer, 10);
 
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-store");
@@ -106,11 +115,17 @@ app.get("/debug-design", async (req, res) => {
 
 // ============================================================================
 // GENERISCHER PREVIEW-ENDPOINT
+// /generic-preview?url=...&mockup_url=...&target_mockup_url=...
+//   [&extra_layer_urls=URL1,URL2]
+//   [&print_x=0.30&print_y=0.28&print_w=0.35&print_h=0.40]
 // ============================================================================
 app.get("/generic-preview", async (req, res) => {
   const artworkUrl = req.query.url;
   const baseMockupUrl = req.query.mockup_url;
   const targetMockupUrl = req.query.target_mockup_url;
+  const extraLayerUrls = req.query.extra_layer_urls
+    ? req.query.extra_layer_urls.split(",").map(s => s.trim()).filter(Boolean)
+    : [];
 
   if (!artworkUrl || typeof artworkUrl !== "string") {
     return res.status(400).json({ error: "Parameter 'url' fehlt." });
@@ -128,7 +143,7 @@ app.get("/generic-preview", async (req, res) => {
   const printH = parseFloat(req.query.print_h) || 0.40;
 
   try {
-    const hash = await buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl);
+    const hash = await buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls);
     const r2Key = `upsell/${hash}.jpg`;
     const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
@@ -147,6 +162,7 @@ app.get("/generic-preview", async (req, res) => {
       artworkUrl,
       baseMockupUrl,
       targetMockupUrl,
+      extraLayerUrls,
       printX,
       printY,
       printW,
@@ -165,6 +181,7 @@ app.get("/generic-preview", async (req, res) => {
 
 // ============================================================================
 // ALTE ENDPOINTS (Rückwärtskompatibilität)
+// Extra-Layer werden hier ebenfalls unterstützt falls mitgeschickt.
 // ============================================================================
 
 const LEGACY_CONFIGS = {
@@ -190,6 +207,9 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
   app.get(path, async (req, res) => {
     const artworkUrl = req.query.url;
     const baseMockupUrl = req.query.mockup_url;
+    const extraLayerUrls = req.query.extra_layer_urls
+      ? req.query.extra_layer_urls.split(",").map(s => s.trim()).filter(Boolean)
+      : [];
 
     if (!artworkUrl || typeof artworkUrl !== "string") {
       return res.status(400).json({ error: "Parameter 'url' fehlt." });
@@ -199,7 +219,7 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
     }
 
     try {
-      const hash = await buildImageHash(artworkUrl, baseMockupUrl, cfg.targetMockupUrl);
+      const hash = await buildImageHash(artworkUrl, baseMockupUrl, cfg.targetMockupUrl, extraLayerUrls);
       const r2Key = `upsell/${hash}.jpg`;
       const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
@@ -216,6 +236,7 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
         artworkUrl,
         baseMockupUrl,
         targetMockupUrl: cfg.targetMockupUrl,
+        extraLayerUrls,
         printX: cfg.printX,
         printY: cfg.printY,
         printW: cfg.printW,
@@ -250,6 +271,55 @@ function colorDistance(r1, g1, b1, r2, g2, b2) {
   const dg = g1 - g2;
   const db = b1 - b2;
   return Math.sqrt(dr * dr + dg * dg + db * db);
+}
+
+// ============================================================================
+// EXTRA-LAYER AUF BASIS COMPOSITEN
+// Lädt alle Extra-Layer-URLs und compositet sie über das Basis-Mockup,
+// damit der anschließende Diff diese Ebenen als "unverändert" erkennt
+// und sie nicht fälschlicherweise als Design extrahiert.
+// ============================================================================
+
+async function compositeLayersOntoBase(baseBuffer, layerUrls = []) {
+  if (!layerUrls.length) return baseBuffer;
+
+  const baseMeta = await sharp(baseBuffer).metadata();
+  const composites = [];
+
+  const layerBuffers = await Promise.all(
+    layerUrls.map(async (url) => {
+      try {
+        return await loadImage(url);
+      } catch (e) {
+        console.warn(`[compositeLayersOntoBase] Layer konnte nicht geladen werden: ${url} — ${e.message}`);
+        return null;
+      }
+    })
+  );
+
+  for (const buf of layerBuffers) {
+    if (!buf) continue;
+    try {
+      const scaled = await sharp(buf)
+        .resize(baseMeta.width, baseMeta.height, { fit: "fill" })
+        .ensureAlpha()
+        .png()
+        .toBuffer();
+      composites.push({ input: scaled, blend: "over" });
+    } catch (e) {
+      console.warn(`[compositeLayersOntoBase] Layer-Skalierung fehlgeschlagen — ${e.message}`);
+    }
+  }
+
+  if (!composites.length) return baseBuffer;
+
+  const result = await sharp(baseBuffer)
+    .composite(composites)
+    .jpeg({ quality: 100 })
+    .toBuffer();
+
+  console.log(`[compositeLayersOntoBase] ${composites.length} Extra-Layer auf Basis gerendert.`);
+  return result;
 }
 
 // ============================================================================
@@ -486,6 +556,7 @@ async function makePreview({
   artworkUrl,
   baseMockupUrl,
   targetMockupUrl,
+  extraLayerUrls = [],
   printX,
   printY,
   printW,
@@ -501,14 +572,21 @@ async function makePreview({
 
   console.log(`[Timing] Bildladung (parallel): ${Date.now() - t0}ms`);
 
-  const designCacheKey = `${artworkUrl}__${baseMockupUrl}`;
+  // Extra-Layer auf die Basis compositen — VOR dem Diff.
+  // Dadurch erkennt extractDesign diese Ebenen als "unveränderter Hintergrund"
+  // und extrahiert nur das echte Kunden-Design.
+  const baseWithLayers = await compositeLayersOntoBase(baseBuf, extraLayerUrls);
+
+  // Cache-Key enthält Extra-Layer → unterschiedliche Designs pro Layer-Kombination
+  const designCacheKey = `${artworkUrl}__${baseMockupUrl}__${extraLayerUrls.join(",")}`;
   let designTransparent;
+
   if (designCache.has(designCacheKey)) {
     console.log(`[Timing] Design aus Cache geladen`);
     designTransparent = designCache.get(designCacheKey);
   } else {
     try {
-      designTransparent = await extractDesign(baseBuf, artBuf, 10);
+      designTransparent = await extractDesign(baseWithLayers, artBuf, 10);
     } catch (err) {
       console.error("Design-Extraction Fehler, verwende Fallback:", err);
       designTransparent = await sharp(artBuf).ensureAlpha().png().toBuffer();
