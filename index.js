@@ -36,7 +36,6 @@ const r2 = new S3Client({
 const R2_BUCKET = process.env.R2_BUCKET;
 const IMG_BASE_URL = "https://img.boostomize.de";
 
-// extraLayerUrls in Hash einbeziehen → unterschiedliche Cache-Einträge pro Layer-Kombination
 async function buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls = []) {
   const raw = `${artworkUrl}|${baseMockupUrl}|${targetMockupUrl}|${extraLayerUrls.join(",")}`;
   const data = new TextEncoder().encode(raw);
@@ -66,7 +65,6 @@ async function uploadToR2(buffer, key) {
   return `${IMG_BASE_URL}/${key}`;
 }
 
-// Cache: hash -> öffentliche URL
 const previewCache = new Map();
 const designCache = new Map();
 
@@ -99,8 +97,7 @@ app.get("/debug-design", async (req, res) => {
       loadImage(baseMockupUrl),
     ]);
 
-    // Extra-Layer auf die Basis compositen bevor der Diff läuft
-    const baseWithLayers = await compositeLayersOntoBase(baseBuffer, extraLayerUrls);
+    const baseWithLayers = await compositeLayersOntoBase(baseBuffer, extraLayerUrls, compositeBuffer);
 
     const designBuffer = await extractDesign(baseWithLayers, compositeBuffer, 10);
 
@@ -115,9 +112,6 @@ app.get("/debug-design", async (req, res) => {
 
 // ============================================================================
 // GENERISCHER PREVIEW-ENDPOINT
-// /generic-preview?url=...&mockup_url=...&target_mockup_url=...
-//   [&extra_layer_urls=URL1,URL2]
-//   [&print_x=0.30&print_y=0.28&print_w=0.35&print_h=0.40]
 // ============================================================================
 app.get("/generic-preview", async (req, res) => {
   const artworkUrl = req.query.url;
@@ -147,12 +141,10 @@ app.get("/generic-preview", async (req, res) => {
     const r2Key = `upsell/${hash}.jpg`;
     const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
-    // RAM-Cache
     if (previewCache.has(hash)) {
       return res.json({ ok: true, url: previewCache.get(hash) });
     }
 
-    // R2-Cache (bereits hochgeladen)
     if (await existsInR2(r2Key)) {
       previewCache.set(hash, publicUrl);
       return res.json({ ok: true, url: publicUrl });
@@ -181,7 +173,6 @@ app.get("/generic-preview", async (req, res) => {
 
 // ============================================================================
 // ALTE ENDPOINTS (Rückwärtskompatibilität)
-// Extra-Layer werden hier ebenfalls unterstützt falls mitgeschickt.
 // ============================================================================
 
 const LEGACY_CONFIGS = {
@@ -275,17 +266,41 @@ function colorDistance(r1, g1, b1, r2, g2, b2) {
 
 // ============================================================================
 // EXTRA-LAYER AUF BASIS COMPOSITEN
-// Lädt alle Extra-Layer-URLs und compositet sie über das Basis-Mockup,
-// damit der anschließende Diff diese Ebenen als "unverändert" erkennt
-// und sie nicht fälschlicherweise als Design extrahiert.
+//
+// WICHTIG: Composite (customization_image) und Layer sind gleich groß (z.B. 960x960).
+// Die Base (mockup_url) hat oft eine andere Größe.
+// Lösung: Base auf die Größe des Composites skalieren, dann Layer drauf —
+// so stimmt der pixelgenaue Diff später.
+//
+// compositeBuffer wird als Referenz für die Zielgröße mitgegeben.
 // ============================================================================
 
-async function compositeLayersOntoBase(baseBuffer, layerUrls = []) {
-  if (!layerUrls.length) return baseBuffer;
+async function compositeLayersOntoBase(baseBuffer, layerUrls = [], compositeBuffer = null) {
+  // Zielgröße bestimmen: Composite-Größe wenn vorhanden, sonst Base-Größe
+  let targetWidth, targetHeight;
 
-  const baseMeta = await sharp(baseBuffer).metadata();
-  const composites = [];
+  if (compositeBuffer) {
+    const compMeta = await sharp(compositeBuffer).metadata();
+    targetWidth  = compMeta.width;
+    targetHeight = compMeta.height;
+  } else {
+    const baseMeta = await sharp(baseBuffer).metadata();
+    targetWidth  = baseMeta.width;
+    targetHeight = baseMeta.height;
+  }
 
+  // Base auf Zielgröße skalieren (damit sie pixelgenau zum Composite passt)
+  let scaledBase = await sharp(baseBuffer)
+    .resize(targetWidth, targetHeight, { fit: "fill" })
+    .jpeg({ quality: 100 })
+    .toBuffer();
+
+  if (!layerUrls.length) {
+    console.log(`[compositeLayersOntoBase] Keine Extra-Layer — Base auf ${targetWidth}x${targetHeight} skaliert.`);
+    return scaledBase;
+  }
+
+  // Layer laden — NICHT skalieren, sie sind bereits in der richtigen Größe (gleich wie Composite)
   const layerBuffers = await Promise.all(
     layerUrls.map(async (url) => {
       try {
@@ -297,28 +312,38 @@ async function compositeLayersOntoBase(baseBuffer, layerUrls = []) {
     })
   );
 
+  const composites = [];
   for (const buf of layerBuffers) {
     if (!buf) continue;
     try {
-      const scaled = await sharp(buf)
-        .resize(baseMeta.width, baseMeta.height, { fit: "fill" })
-        .ensureAlpha()
-        .png()
-        .toBuffer();
-      composites.push({ input: scaled, blend: "over" });
+      const layerMeta = await sharp(buf).metadata();
+      let layerInput = buf;
+
+      // Nur skalieren wenn Layer-Größe nicht zur Zielgröße passt
+      if (layerMeta.width !== targetWidth || layerMeta.height !== targetHeight) {
+        console.warn(`[compositeLayersOntoBase] Layer hat abweichende Größe (${layerMeta.width}x${layerMeta.height} vs ${targetWidth}x${targetHeight}) — wird skaliert.`);
+        layerInput = await sharp(buf)
+          .resize(targetWidth, targetHeight, { fit: "fill" })
+          .png()
+          .toBuffer();
+      } else {
+        layerInput = await sharp(buf).ensureAlpha().png().toBuffer();
+      }
+
+      composites.push({ input: layerInput, blend: "over" });
     } catch (e) {
-      console.warn(`[compositeLayersOntoBase] Layer-Skalierung fehlgeschlagen — ${e.message}`);
+      console.warn(`[compositeLayersOntoBase] Layer-Verarbeitung fehlgeschlagen — ${e.message}`);
     }
   }
 
-  if (!composites.length) return baseBuffer;
+  if (!composites.length) return scaledBase;
 
-  const result = await sharp(baseBuffer)
+  const result = await sharp(scaledBase)
     .composite(composites)
     .jpeg({ quality: 100 })
     .toBuffer();
 
-  console.log(`[compositeLayersOntoBase] ${composites.length} Extra-Layer auf Basis gerendert.`);
+  console.log(`[compositeLayersOntoBase] Base auf ${targetWidth}x${targetHeight} skaliert, ${composites.length} Extra-Layer drauf gerendert.`);
   return result;
 }
 
@@ -572,12 +597,10 @@ async function makePreview({
 
   console.log(`[Timing] Bildladung (parallel): ${Date.now() - t0}ms`);
 
-  // Extra-Layer auf die Basis compositen — VOR dem Diff.
-  // Dadurch erkennt extractDesign diese Ebenen als "unveränderter Hintergrund"
-  // und extrahiert nur das echte Kunden-Design.
-  const baseWithLayers = await compositeLayersOntoBase(baseBuf, extraLayerUrls);
+  // artBuf als Referenz für Zielgröße mitgeben →
+  // Base wird auf Composite-Größe skaliert, Layer passen dann pixelgenau
+  const baseWithLayers = await compositeLayersOntoBase(baseBuf, extraLayerUrls, artBuf);
 
-  // Cache-Key enthält Extra-Layer → unterschiedliche Designs pro Layer-Kombination
   const designCacheKey = `${artworkUrl}__${baseMockupUrl}__${extraLayerUrls.join(",")}`;
   let designTransparent;
 
