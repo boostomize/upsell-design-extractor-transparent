@@ -36,8 +36,9 @@ const r2 = new S3Client({
 const R2_BUCKET = process.env.R2_BUCKET;
 const IMG_BASE_URL = "https://img.boostomize.de";
 
-async function buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls = []) {
-  const raw = `${artworkUrl}|${baseMockupUrl}|${targetMockupUrl}|${extraLayerUrls.join(",")}`;
+async function buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos = []) {
+  const layerStr = layerInfos.map(l => `${l.url}:${l.x}:${l.y}:${l.w}:${l.h}`).join(",");
+  const raw = `${artworkUrl}|${baseMockupUrl}|${targetMockupUrl}|${layerStr}`;
   const data = new TextEncoder().encode(raw);
   const hashBuffer = await crypto.subtle.digest("SHA-1", data);
   return Array.from(new Uint8Array(hashBuffer))
@@ -78,9 +79,10 @@ app.get("/", (req, res) => {
 app.get("/debug-design", async (req, res) => {
   const artworkUrl    = req.query.url;
   const baseMockupUrl = req.query.mockup_url;
-  const extraLayerUrls = req.query.extra_layer_urls
-    ? req.query.extra_layer_urls.split(",").map(s => s.trim()).filter(Boolean)
-    : [];
+  const layerInfos = (() => {
+    try { return req.query.layer_infos ? JSON.parse(req.query.layer_infos) : []; }
+    catch(e) { return []; }
+  })();
 
   if (!artworkUrl    || typeof artworkUrl    !== "string") return res.status(400).json({ error: "Parameter 'url' fehlt." });
   if (!baseMockupUrl || typeof baseMockupUrl !== "string") return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
@@ -90,7 +92,7 @@ app.get("/debug-design", async (req, res) => {
       loadImage(artworkUrl),
       loadImage(baseMockupUrl),
     ]);
-    const baseWithLayers = await compositeLayersOntoBase(baseBuffer, extraLayerUrls, compositeBuffer);
+    const baseWithLayers = await compositeLayersOntoBase(baseBuffer, layerInfos, compositeBuffer);
     const designBuffer   = await extractDesign(baseWithLayers, compositeBuffer, 10);
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-store");
@@ -108,9 +110,10 @@ app.get("/generic-preview", async (req, res) => {
   const artworkUrl      = req.query.url;
   const baseMockupUrl   = req.query.mockup_url;
   const targetMockupUrl = req.query.target_mockup_url;
-  const extraLayerUrls  = req.query.extra_layer_urls
-    ? req.query.extra_layer_urls.split(",").map(s => s.trim()).filter(Boolean)
-    : [];
+  const layerInfos = (() => {
+    try { return req.query.layer_infos ? JSON.parse(req.query.layer_infos) : []; }
+    catch(e) { return []; }
+  })();
 
   if (!artworkUrl      || typeof artworkUrl      !== "string") return res.status(400).json({ error: "Parameter 'url' fehlt." });
   if (!baseMockupUrl   || typeof baseMockupUrl   !== "string") return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
@@ -122,14 +125,14 @@ app.get("/generic-preview", async (req, res) => {
   const printH = parseFloat(req.query.print_h) || 0.40;
 
   try {
-    const hash      = await buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls);
+    const hash      = await buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos);
     const r2Key     = `upsell/${hash}.jpg`;
     const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
     if (previewCache.has(hash)) return res.json({ ok: true, url: previewCache.get(hash) });
     if (await existsInR2(r2Key)) { previewCache.set(hash, publicUrl); return res.json({ ok: true, url: publicUrl }); }
 
-    const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls, printX, printY, printW, printH });
+    const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos, printX, printY, printW, printH });
     await uploadToR2(finalBuffer, r2Key);
     previewCache.set(hash, publicUrl);
     return res.json({ ok: true, url: publicUrl });
@@ -153,22 +156,23 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
   app.get(path, async (req, res) => {
     const artworkUrl    = req.query.url;
     const baseMockupUrl = req.query.mockup_url;
-    const extraLayerUrls = req.query.extra_layer_urls
-      ? req.query.extra_layer_urls.split(",").map(s => s.trim()).filter(Boolean)
-      : [];
+    const layerInfos = (() => {
+      try { return req.query.layer_infos ? JSON.parse(req.query.layer_infos) : []; }
+      catch(e) { return []; }
+    })();
 
     if (!artworkUrl    || typeof artworkUrl    !== "string") return res.status(400).json({ error: "Parameter 'url' fehlt." });
     if (!baseMockupUrl || typeof baseMockupUrl !== "string") return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
 
     try {
-      const hash      = await buildImageHash(artworkUrl, baseMockupUrl, cfg.targetMockupUrl, extraLayerUrls);
+      const hash      = await buildImageHash(artworkUrl, baseMockupUrl, cfg.targetMockupUrl, layerInfos);
       const r2Key     = `upsell/${hash}.jpg`;
       const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
       if (previewCache.has(hash)) return res.json({ ok: true, url: previewCache.get(hash) });
       if (await existsInR2(r2Key)) { previewCache.set(hash, publicUrl); return res.json({ ok: true, url: publicUrl }); }
 
-      const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl: cfg.targetMockupUrl, extraLayerUrls, printX: cfg.printX, printY: cfg.printY, printW: cfg.printW, printH: cfg.printH });
+      const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl: cfg.targetMockupUrl, layerInfos, printX: cfg.printX, printY: cfg.printY, printW: cfg.printW, printH: cfg.printH });
       await uploadToR2(finalBuffer, r2Key);
       previewCache.set(hash, publicUrl);
       return res.json({ ok: true, url: publicUrl });
@@ -195,86 +199,17 @@ function colorDistance(r1, g1, b1, r2, g2, b2) {
 }
 
 // ============================================================================
-// AUTO-OFFSET-ERKENNUNG (Cross-Correlation)
+// EXTRA-LAYER AUF BASIS COMPOSITEN
 //
-// Problem: Das Layer-File hat den Banner z.B. bei y=667, im finalen Composite
-// erscheint er aber bei y=840. Einfaches Drüberlegen an Position (0,0) schlägt
-// daher fehl — die Layer-Subtraktion entfernt den Banner NICHT.
-//
-// Lösung: Für jeden möglichen vertikalen Versatz (offset) berechnen wir, wie
-// gut (Base + Layer_versetzt) mit dem Composite übereinstimmt.
-// Minimaler Diff = korrekter Offset. Zwei-Phasen-Suche: grob (Schritt 5),
-// dann fein (Schritt 1) im ±10px-Bereich um das Grob-Optimum.
+// Das Frontend schickt layer_infos als JSON: [{url, x, y, w, h}, ...]
+// x, y, w, h sind 0..1 relativ zum Mockup-Container (aus CSS ausgelesen).
+// Das Backend skaliert jeden Layer auf seine tatsächliche Pixelgröße und
+// platziert ihn an der exakt richtigen Position — so wie teeinblue es tut.
+// Kein Auto-Offset nötig, da Position direkt aus dem DOM kommt.
 // ============================================================================
 
-async function findBestLayerOffset(baseRaw, layerRaw, compRaw, w, h) {
-  // Opaken Zeilenbereich des Layers bestimmen
-  let layerMinY = h, layerMaxY = 0;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x += 4) {
-      if (layerRaw[(y * w + x) * 4 + 3] > 50) {
-        if (y < layerMinY) layerMinY = y;
-        if (y > layerMaxY) layerMaxY = y;
-        break;
-      }
-    }
-  }
-  if (layerMinY >= layerMaxY) {
-    console.log("[findBestLayerOffset] Kein opaker Bereich gefunden, Offset=0");
-    return 0;
-  }
-
-  const layerH = layerMaxY - layerMinY + 1;
-  console.log(`[findBestLayerOffset] Layer opak: y=${layerMinY}..${layerMaxY} (${layerH}px), suche besten Offset...`);
-
-  function scoreOffset(offset, xStep, yStep) {
-    const dstStart = layerMinY + offset;
-    if (dstStart < 0 || dstStart + layerH > h) return Infinity;
-    let totalDiff = 0, count = 0;
-    for (let dy = 0; dy < layerH; dy += yStep) {
-      const srcY = layerMinY + dy;
-      const dstY = dstStart + dy;
-      for (let x = 0; x < w; x += xStep) {
-        const li = (srcY * w + x) * 4;
-        const layerAlpha = layerRaw[li + 3] / 255;
-        if (layerAlpha < 0.2) continue;
-        const bi = (dstY * w + x) * 4;
-        const ci = bi; // compRaw ist gleich indiziert
-        const blR = layerRaw[li]   * layerAlpha + baseRaw[bi]   * (1 - layerAlpha);
-        const blG = layerRaw[li+1] * layerAlpha + baseRaw[bi+1] * (1 - layerAlpha);
-        const blB = layerRaw[li+2] * layerAlpha + baseRaw[bi+2] * (1 - layerAlpha);
-        const dr = compRaw[ci] - blR, dg = compRaw[ci+1] - blG, db = compRaw[ci+2] - blB;
-        totalDiff += Math.sqrt(dr*dr + dg*dg + db*db);
-        count++;
-      }
-    }
-    return count > 0 ? totalDiff / count : Infinity;
-  }
-
-  // Phase 1: Grob-Suche (Schritt 5, jeden 2. Pixel vertikal, jeden 4. horizontal)
-  let bestOffset = 0, bestScore = Infinity;
-  for (let offset = -(h - layerH); offset <= (h - layerH); offset += 5) {
-    const score = scoreOffset(offset, 4, 2);
-    if (score < bestScore) { bestScore = score; bestOffset = offset; }
-  }
-
-  // Phase 2: Fein-Suche ±10px um Grob-Optimum (Schritt 1, jeden Pixel)
-  const coarse = bestOffset;
-  for (let offset = coarse - 10; offset <= coarse + 10; offset++) {
-    const score = scoreOffset(offset, 2, 1);
-    if (score < bestScore) { bestScore = score; bestOffset = offset; }
-  }
-
-  console.log(`[findBestLayerOffset] Bester Offset: ${bestOffset > 0 ? "+" : ""}${bestOffset}px (Score: ${bestScore.toFixed(2)})`);
-  return bestOffset;
-}
-
-// ============================================================================
-// EXTRA-LAYER AUF BASIS COMPOSITEN (mit Auto-Offset)
-// ============================================================================
-
-async function compositeLayersOntoBase(baseBuffer, layerUrls = [], compositeBuffer = null) {
-  if (!layerUrls.length) return baseBuffer;
+async function compositeLayersOntoBase(baseBuffer, layerInfos = [], compositeBuffer = null) {
+  if (!layerInfos.length) return baseBuffer;
 
   // Zielgröße = Composite-Größe (damit Diff pixelgenau stimmt)
   let targetW, targetH;
@@ -287,78 +222,39 @@ async function compositeLayersOntoBase(baseBuffer, layerUrls = [], compositeBuff
   }
 
   // Base auf Zielgröße skalieren
-  let scaledBase = await sharp(baseBuffer)
+  const scaledBase = await sharp(baseBuffer)
     .resize(targetW, targetH, { fit: "fill" })
     .jpeg({ quality: 100 })
     .toBuffer();
 
-  // Raw-Puffer für Offset-Erkennung (einmalig)
-  const baseRaw = await sharp(scaledBase).ensureAlpha().raw().toBuffer();
-  const compRaw = compositeBuffer
-    ? await sharp(compositeBuffer).resize(targetW, targetH, { fit: "fill" }).ensureAlpha().raw().toBuffer()
-    : null;
-
   const composites = [];
 
-  for (const url of layerUrls) {
-    let layerBuf;
-    try { layerBuf = await loadImage(url); }
-    catch (e) {
-      console.warn(`[compositeLayersOntoBase] Layer konnte nicht geladen werden: ${url} — ${e.message}`);
-      continue;
-    }
-
+  for (const info of layerInfos) {
+    if (!info.url) continue;
     try {
-      // Layer auf Zielgröße bringen falls nötig
-      const lm = await sharp(layerBuf).metadata();
-      if (lm.width !== targetW || lm.height !== targetH) {
-        layerBuf = await sharp(layerBuf).resize(targetW, targetH, { fit: "fill" }).png().toBuffer();
-      }
+      const layerBuf = await loadImage(info.url);
+      // Exakte Pixelgröße und Position aus den relativen CSS-Werten berechnen
+      const layerW = Math.round(info.w * targetW);
+      const layerH = Math.round(info.h * targetH);
+      const layerX = Math.round(info.x * targetW);
+      const layerY = Math.round(info.y * targetH);
 
-      const layerRaw = await sharp(layerBuf).ensureAlpha().raw().toBuffer();
+      const scaled = await sharp(layerBuf)
+        .resize(layerW, layerH, { fit: "fill" })
+        .png()
+        .toBuffer();
 
-      // Korrekten vertikalen Offset automatisch ermitteln
-      const offsetY = compRaw ? await findBestLayerOffset(baseRaw, layerRaw, compRaw, targetW, targetH) : 0;
-
-      if (offsetY === 0) {
-        // Kein Versatz — direkt verwenden
-        composites.push({ input: await sharp(layerBuf).ensureAlpha().png().toBuffer(), blend: "over" });
-      } else {
-        // Layer in leeres Canvas mit korrektem Versatz einbauen
-        const shifted = Buffer.alloc(targetW * targetH * 4, 0);
-
-        let layerMinY = targetH, layerMaxY = 0;
-        for (let y = 0; y < targetH; y++)
-          for (let x = 0; x < targetW; x += 4)
-            if (layerRaw[(y * targetW + x) * 4 + 3] > 50) {
-              if (y < layerMinY) layerMinY = y;
-              if (y > layerMaxY) layerMaxY = y;
-              break;
-            }
-
-        const dstStart = layerMinY + offsetY;
-        const copyH    = Math.min(layerMaxY - layerMinY + 1, targetH - Math.max(0, dstStart));
-        if (dstStart >= 0 && copyH > 0) {
-          for (let dy = 0; dy < copyH; dy++) {
-            const srcOff = (layerMinY + dy) * targetW * 4;
-            const dstOff = (dstStart  + dy) * targetW * 4;
-            layerRaw.copy(shifted, dstOff, srcOff, srcOff + targetW * 4);
-          }
-        }
-
-        const png = await sharp(shifted, { raw: { width: targetW, height: targetH, channels: 4 } }).png().toBuffer();
-        composites.push({ input: png, blend: "over" });
-        console.log(`[compositeLayersOntoBase] Layer mit Offset ${offsetY > 0 ? "+" : ""}${offsetY}px platziert.`);
-      }
+      composites.push({ input: scaled, left: layerX, top: layerY, blend: "over" });
+      console.log(`[compositeLayersOntoBase] Layer → ${layerW}x${layerH} @ (${layerX},${layerY})`);
     } catch (e) {
-      console.warn(`[compositeLayersOntoBase] Layer-Verarbeitung fehlgeschlagen — ${e.message}`);
+      console.warn(`[compositeLayersOntoBase] Layer fehlgeschlagen: ${e.message}`);
     }
   }
 
   if (!composites.length) return scaledBase;
 
   const result = await sharp(scaledBase).composite(composites).jpeg({ quality: 100 }).toBuffer();
-  console.log(`[compositeLayersOntoBase] ${composites.length} Extra-Layer auf ${targetW}x${targetH} Base gerendert.`);
+  console.log(`[compositeLayersOntoBase] ${composites.length} Layer auf ${targetW}x${targetH} Base gerendert.`);
   return result;
 }
 
@@ -563,7 +459,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
 // PREVIEW-ERSTELLUNG (generisch)
 // ============================================================================
 
-async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, extraLayerUrls = [], printX, printY, printW, printH }) {
+async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos = [], printX, printY, printW, printH }) {
   const t0 = Date.now();
 
   const [artBuf, baseBuf, targetBuf] = await Promise.all([
@@ -573,10 +469,10 @@ async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, extraLa
   ]);
   console.log(`[Timing] Bildladung (parallel): ${Date.now() - t0}ms`);
 
-  // artBuf (Composite) als Referenz → Auto-Offset erkennt korrekte Layer-Position
-  const baseWithLayers = await compositeLayersOntoBase(baseBuf, extraLayerUrls, artBuf);
+  // Layer mit exakter Position aus CSS-Werten auf die Basis compositen
+  const baseWithLayers = await compositeLayersOntoBase(baseBuf, layerInfos, artBuf);
 
-  const designCacheKey = `${artworkUrl}__${baseMockupUrl}__${extraLayerUrls.join(",")}`;
+  const designCacheKey = `${artworkUrl}__${baseMockupUrl}__${layerInfos.map(l=>l.url).join(",")}`;
   let designTransparent;
 
   if (designCache.has(designCacheKey)) {
