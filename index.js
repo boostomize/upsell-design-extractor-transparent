@@ -66,8 +66,19 @@ async function uploadToR2(buffer, key) {
   return `${IMG_BASE_URL}/${key}`;
 }
 
-const previewCache = new Map();
-const designCache = new Map();
+function makeBoundedCache(max = 200) {
+  const m = new Map();
+  return {
+    has: k => m.has(k),
+    get: k => m.get(k),
+    set(k, v) {
+      if (m.size >= max) m.delete(m.keys().next().value);
+      m.set(k, v);
+    }
+  };
+}
+const previewCache = new makeBoundedCache(500);
+const designCache  = new makeBoundedCache(100);
 
 app.get("/", (req, res) => {
   res.send("upsell-preview-backend (generisch) läuft.");
