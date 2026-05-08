@@ -4,9 +4,12 @@
   "description": "Exklusive und einzigartige Möglichkeit, Upsells für personalisierte Print on Demand Produkte anzubieten.",
   "main": "index.js",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "engines": {
+  "node": "22.11.0"
+},
+"scripts": {
+  "start": "node index.js"
+},
   "dependencies": {
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
