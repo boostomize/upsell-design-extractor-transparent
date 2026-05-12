@@ -140,13 +140,22 @@ app.get("/generic-preview", async (req, res) => {
     const r2Key     = `upsell/${hash}.jpg`;
     const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
+    // Cache-Hit: URL bekannt, kein preview nötig (CDN liefert sofort)
     if (previewCache.has(hash)) return res.json({ ok: true, url: previewCache.get(hash) });
     if (await existsInR2(r2Key)) { previewCache.set(hash, publicUrl); return res.json({ ok: true, url: publicUrl }); }
 
+    // Neu berechnen
     const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos, printX, printY, printW, printH });
-    await uploadToR2(finalBuffer, r2Key);
-    previewCache.set(hash, publicUrl);
-    return res.json({ ok: true, url: publicUrl });
+    const preview     = `data:image/jpeg;base64,${finalBuffer.toString("base64")}`;
+
+    // Sofort antworten — Client wartet nicht auf R2
+    res.json({ ok: true, url: publicUrl, preview });
+
+    // R2 Upload im Hintergrund
+    uploadToR2(finalBuffer, r2Key)
+      .then(() => previewCache.set(hash, publicUrl))
+      .catch(err => console.error("R2 Upload fehlgeschlagen:", err));
+
   } catch (err) {
     console.error("Fehler in /generic-preview:", err);
     res.status(500).json({ error: "Interner Fehler", detail: err.message });
@@ -180,13 +189,22 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
       const r2Key     = `upsell/${hash}.jpg`;
       const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
 
+      // Cache-Hit: URL bekannt, kein preview nötig (CDN liefert sofort)
       if (previewCache.has(hash)) return res.json({ ok: true, url: previewCache.get(hash) });
       if (await existsInR2(r2Key)) { previewCache.set(hash, publicUrl); return res.json({ ok: true, url: publicUrl }); }
 
+      // Neu berechnen
       const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl: cfg.targetMockupUrl, layerInfos, printX: cfg.printX, printY: cfg.printY, printW: cfg.printW, printH: cfg.printH });
-      await uploadToR2(finalBuffer, r2Key);
-      previewCache.set(hash, publicUrl);
-      return res.json({ ok: true, url: publicUrl });
+      const preview     = `data:image/jpeg;base64,${finalBuffer.toString("base64")}`;
+
+      // Sofort antworten — Client wartet nicht auf R2
+      res.json({ ok: true, url: publicUrl, preview });
+
+      // R2 Upload im Hintergrund
+      uploadToR2(finalBuffer, r2Key)
+        .then(() => previewCache.set(hash, publicUrl))
+        .catch(err => console.error(`R2 Upload fehlgeschlagen (${path}):`, err));
+
     } catch (err) {
       console.error(`Fehler in ${path}:`, err);
       res.status(500).json({ error: "Interner Fehler", detail: err.message });
@@ -480,8 +498,10 @@ async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerIn
   ]);
   console.log(`[Timing] Bildladung (parallel): ${Date.now() - t0}ms`);
 
-  // Layer mit exakter Position aus CSS-Werten auf die Basis compositen
-  const baseWithLayers = await compositeLayersOntoBase(baseBuf, layerInfos, artBuf);
+  // compositeLayersOntoBase nur aufrufen wenn Layer vorhanden
+  const baseWithLayers = layerInfos.length
+    ? await compositeLayersOntoBase(baseBuf, layerInfos, artBuf)
+    : baseBuf;
 
   const designCacheKey = `${artworkUrl}__${baseMockupUrl}__${layerInfos.map(l=>l.url).join(",")}`;
   let designTransparent;
