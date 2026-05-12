@@ -2,7 +2,6 @@
 import express from "express";
 import fetch from "node-fetch";
 import sharp from "sharp";
-import { S3Client, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 
 const app = express();
 
@@ -20,91 +19,37 @@ const SHOPIFY_FETCH_HEADERS = {
   Accept: "image/avif,image/webp,image/png,image/*,*/*",
 };
 
-// ============================================================================
-// R2 CLIENT
-// ============================================================================
+// Cache: artworkUrl + target -> fertiges PNG
+const previewCache = new Map();
+const designCache = new Map();
 
-const r2 = new S3Client({
-  region: "auto",
-  endpoint: process.env.R2_ENDPOINT,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  },
-});
-
-const R2_BUCKET = process.env.R2_BUCKET;
-const IMG_BASE_URL = "https://img.boostomize.de";
-
-async function buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos = []) {
-  const layerStr = layerInfos.map(l => `${l.url}:${l.x}:${l.y}:${l.w}:${l.h}`).join(",");
-  const raw = `${artworkUrl}|${baseMockupUrl}|${targetMockupUrl}|${layerStr}`;
-  const data = new TextEncoder().encode(raw);
-  const hashBuffer = await crypto.subtle.digest("SHA-1", data);
-  return Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function existsInR2(key) {
-  try {
-    await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function uploadToR2(buffer, key) {
-  await r2.send(new PutObjectCommand({
-    Bucket: R2_BUCKET,
-    Key: key,
-    Body: buffer,
-    ContentType: "image/jpeg",
-    CacheControl: "public, max-age=31536000, immutable",
-  }));
-  return `${IMG_BASE_URL}/${key}`;
-}
-
-function makeBoundedCache(max = 200) {
-  const m = new Map();
-  return {
-    has: k => m.has(k),
-    get: k => m.get(k),
-    set(k, v) {
-      if (m.size >= max) m.delete(m.keys().next().value);
-      m.set(k, v);
-    }
-  };
-}
-const previewCache = new makeBoundedCache(500);
-const designCache  = new makeBoundedCache(100);
-
+// Healthcheck
 app.get("/", (req, res) => {
   res.send("upsell-preview-backend (generisch) läuft.");
 });
 
 // ============================================================================
 // DEBUG: Nur Design-Extraktion (ohne Placement)
+// /debug-design?url=COMPOSITE_URL&mockup_url=BASE_MOCKUP_URL
 // ============================================================================
 app.get("/debug-design", async (req, res) => {
-  const artworkUrl    = req.query.url;
+  const artworkUrl = req.query.url;
   const baseMockupUrl = req.query.mockup_url;
-  const layerInfos = (() => {
-    try { return req.query.layer_infos ? JSON.parse(req.query.layer_infos) : []; }
-    catch(e) { return []; }
-  })();
 
-  if (!artworkUrl    || typeof artworkUrl    !== "string") return res.status(400).json({ error: "Parameter 'url' fehlt." });
-  if (!baseMockupUrl || typeof baseMockupUrl !== "string") return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
+  if (!artworkUrl || typeof artworkUrl !== "string") {
+    return res.status(400).json({ error: "Parameter 'url' fehlt." });
+  }
+  if (!baseMockupUrl || typeof baseMockupUrl !== "string") {
+    return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
+  }
 
   try {
     const [compositeBuffer, baseBuffer] = await Promise.all([
       loadImage(artworkUrl),
       loadImage(baseMockupUrl),
     ]);
-    const baseWithLayers = await compositeLayersOntoBase(baseBuffer, layerInfos, compositeBuffer);
-    const designBuffer   = await extractDesign(baseWithLayers, compositeBuffer, 10);
+    const designBuffer = await extractDesign(baseBuffer, compositeBuffer, 10);
+
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-store");
     res.send(designBuffer);
@@ -118,35 +63,46 @@ app.get("/debug-design", async (req, res) => {
 // GENERISCHER PREVIEW-ENDPOINT
 // ============================================================================
 app.get("/generic-preview", async (req, res) => {
-  const artworkUrl      = req.query.url;
-  const baseMockupUrl   = req.query.mockup_url;
+  const artworkUrl = req.query.url;
+  const baseMockupUrl = req.query.mockup_url;
   const targetMockupUrl = req.query.target_mockup_url;
-  const layerInfos = (() => {
-    try { return req.query.layer_infos ? JSON.parse(req.query.layer_infos) : []; }
-    catch(e) { return []; }
-  })();
 
-  if (!artworkUrl      || typeof artworkUrl      !== "string") return res.status(400).json({ error: "Parameter 'url' fehlt." });
-  if (!baseMockupUrl   || typeof baseMockupUrl   !== "string") return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
-  if (!targetMockupUrl || typeof targetMockupUrl !== "string") return res.status(400).json({ error: "Parameter 'target_mockup_url' fehlt." });
+  if (!artworkUrl || typeof artworkUrl !== "string") {
+    return res.status(400).json({ error: "Parameter 'url' fehlt." });
+  }
+  if (!baseMockupUrl || typeof baseMockupUrl !== "string") {
+    return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
+  }
+  if (!targetMockupUrl || typeof targetMockupUrl !== "string") {
+    return res.status(400).json({ error: "Parameter 'target_mockup_url' fehlt." });
+  }
 
   const printX = parseFloat(req.query.print_x) || 0.30;
   const printY = parseFloat(req.query.print_y) || 0.28;
   const printW = parseFloat(req.query.print_w) || 0.35;
   const printH = parseFloat(req.query.print_h) || 0.40;
 
+  const cacheKey = `GENERIC_${artworkUrl}_${baseMockupUrl}_${targetMockupUrl}_${printX}_${printY}_${printW}_${printH}`;
+  if (previewCache.has(cacheKey)) {
+    res.setHeader("Content-Type", "image/jpeg");
+    return res.send(previewCache.get(cacheKey));
+  }
+
   try {
-    const hash      = await buildImageHash(artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos);
-    const r2Key     = `upsell/${hash}.jpg`;
-    const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
+    const finalBuffer = await makePreview({
+      artworkUrl,
+      baseMockupUrl,
+      targetMockupUrl,
+      printX,
+      printY,
+      printW,
+      printH,
+    });
 
-    if (previewCache.has(hash)) return res.json({ ok: true, url: previewCache.get(hash) });
-    if (await existsInR2(r2Key)) { previewCache.set(hash, publicUrl); return res.json({ ok: true, url: publicUrl }); }
-
-    const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos, printX, printY, printW, printH });
-    await uploadToR2(finalBuffer, r2Key);
-    previewCache.set(hash, publicUrl);
-    return res.json({ ok: true, url: publicUrl });
+    previewCache.set(cacheKey, finalBuffer);
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(finalBuffer);
   } catch (err) {
     console.error("Fehler in /generic-preview:", err);
     res.status(500).json({ error: "Interner Fehler", detail: err.message });
@@ -156,37 +112,58 @@ app.get("/generic-preview", async (req, res) => {
 // ============================================================================
 // ALTE ENDPOINTS (Rückwärtskompatibilität)
 // ============================================================================
+
 const LEGACY_CONFIGS = {
-  "/tote-preview":     { targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1902.jpg?v=1765218360", printX: 0.32, printY: 0.42, printW: 0.33, printH: 0.33 },
-  "/mug-preview":      { targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1901.jpg?v=1765218358", printX: 0.35, printY: 0.39, printW: 0.325, printH: 0.325 },
-  "/tee-white-preview":{ targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1926.jpg?v=1765367168", printX: 0.30, printY: 0.28, printW: 0.38, printH: 0.38 },
-  "/tee-black-preview":{ targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1924.jpg?v=1765367167", printX: 0.30, printY: 0.28, printW: 0.38, printH: 0.38 },
+  "/tote-preview": {
+    targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1902.jpg?v=1765218360",
+    printX: 0.32, printY: 0.42, printW: 0.33, printH: 0.33,
+  },
+  "/mug-preview": {
+    targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1901.jpg?v=1765218358",
+    printX: 0.35, printY: 0.39, printW: 0.325, printH: 0.325,
+  },
+  "/tee-white-preview": {
+    targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1926.jpg?v=1765367168",
+    printX: 0.30, printY: 0.28, printW: 0.38, printH: 0.38,
+  },
+  "/tee-black-preview": {
+    targetMockupUrl: "https://cdn.shopify.com/s/files/1/0958/7346/6743/files/IMG_1924.jpg?v=1765367167",
+    printX: 0.30, printY: 0.28, printW: 0.38, printH: 0.38,
+  },
 };
 
 for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
   app.get(path, async (req, res) => {
-    const artworkUrl    = req.query.url;
+    const artworkUrl = req.query.url;
     const baseMockupUrl = req.query.mockup_url;
-    const layerInfos = (() => {
-      try { return req.query.layer_infos ? JSON.parse(req.query.layer_infos) : []; }
-      catch(e) { return []; }
-    })();
 
-    if (!artworkUrl    || typeof artworkUrl    !== "string") return res.status(400).json({ error: "Parameter 'url' fehlt." });
-    if (!baseMockupUrl || typeof baseMockupUrl !== "string") return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
+    if (!artworkUrl || typeof artworkUrl !== "string") {
+      return res.status(400).json({ error: "Parameter 'url' fehlt." });
+    }
+    if (!baseMockupUrl || typeof baseMockupUrl !== "string") {
+      return res.status(400).json({ error: "Parameter 'mockup_url' fehlt." });
+    }
+
+    const cacheKey = `LEGACY_${path}_${artworkUrl}_${baseMockupUrl}`;
+    if (previewCache.has(cacheKey)) {
+      res.setHeader("Content-Type", "image/jpeg");
+      return res.send(previewCache.get(cacheKey));
+    }
 
     try {
-      const hash      = await buildImageHash(artworkUrl, baseMockupUrl, cfg.targetMockupUrl, layerInfos);
-      const r2Key     = `upsell/${hash}.jpg`;
-      const publicUrl = `${IMG_BASE_URL}/${r2Key}`;
+      const finalBuffer = await makePreview({
+        artworkUrl,
+        baseMockupUrl,
+        targetMockupUrl: cfg.targetMockupUrl,
+        printX: cfg.printX,
+        printY: cfg.printY,
+        printW: cfg.printW,
+        printH: cfg.printH,
+      });
 
-      if (previewCache.has(hash)) return res.json({ ok: true, url: previewCache.get(hash) });
-      if (await existsInR2(r2Key)) { previewCache.set(hash, publicUrl); return res.json({ ok: true, url: publicUrl }); }
-
-      const finalBuffer = await makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl: cfg.targetMockupUrl, layerInfos, printX: cfg.printX, printY: cfg.printY, printW: cfg.printW, printH: cfg.printH });
-      await uploadToR2(finalBuffer, r2Key);
-      previewCache.set(hash, publicUrl);
-      return res.json({ ok: true, url: publicUrl });
+      previewCache.set(cacheKey, finalBuffer);
+      res.setHeader("Content-Type", "image/jpeg");
+      res.send(finalBuffer);
     } catch (err) {
       console.error(`Fehler in ${path}:`, err);
       res.status(500).json({ error: "Interner Fehler", detail: err.message });
@@ -200,73 +177,17 @@ for (const [path, cfg] of Object.entries(LEGACY_CONFIGS)) {
 
 async function loadImage(url) {
   const resp = await fetch(url, { headers: SHOPIFY_FETCH_HEADERS });
-  if (!resp.ok) throw new Error(`Bild konnte nicht geladen werden: ${url} (HTTP ${resp.status})`);
+  if (!resp.ok) {
+    throw new Error(`Bild konnte nicht geladen werden: ${url} (HTTP ${resp.status})`);
+  }
   return Buffer.from(await resp.arrayBuffer());
 }
 
 function colorDistance(r1, g1, b1, r2, g2, b2) {
-  const dr = r1-r2, dg = g1-g2, db = b1-b2;
-  return Math.sqrt(dr*dr + dg*dg + db*db);
-}
-
-// ============================================================================
-// EXTRA-LAYER AUF BASIS COMPOSITEN
-//
-// Das Frontend schickt layer_infos als JSON: [{url, x, y, w, h}, ...]
-// x, y, w, h sind 0..1 relativ zum Mockup-Container (aus CSS ausgelesen).
-// Das Backend skaliert jeden Layer auf seine tatsächliche Pixelgröße und
-// platziert ihn an der exakt richtigen Position — so wie teeinblue es tut.
-// Kein Auto-Offset nötig, da Position direkt aus dem DOM kommt.
-// ============================================================================
-
-async function compositeLayersOntoBase(baseBuffer, layerInfos = [], compositeBuffer = null) {
-  if (!layerInfos.length) return baseBuffer;
-
-  // Zielgröße = Composite-Größe (damit Diff pixelgenau stimmt)
-  let targetW, targetH;
-  if (compositeBuffer) {
-    const m = await sharp(compositeBuffer).metadata();
-    targetW = m.width; targetH = m.height;
-  } else {
-    const m = await sharp(baseBuffer).metadata();
-    targetW = m.width; targetH = m.height;
-  }
-
-  // Base auf Zielgröße skalieren
-  const scaledBase = await sharp(baseBuffer)
-    .resize(targetW, targetH, { fit: "fill" })
-    .jpeg({ quality: 100 })
-    .toBuffer();
-
-  const composites = [];
-
-  for (const info of layerInfos) {
-    if (!info.url) continue;
-    try {
-      const layerBuf = await loadImage(info.url);
-      // Exakte Pixelgröße und Position aus den relativen CSS-Werten berechnen
-      const layerW = Math.round(info.w * targetW);
-      const layerH = Math.round(info.h * targetH);
-      const layerX = Math.round(info.x * targetW);
-      const layerY = Math.round(info.y * targetH);
-
-      const scaled = await sharp(layerBuf)
-        .resize(layerW, layerH, { fit: "fill" })
-        .png()
-        .toBuffer();
-
-      composites.push({ input: scaled, left: layerX, top: layerY, blend: "over" });
-      console.log(`[compositeLayersOntoBase] Layer → ${layerW}x${layerH} @ (${layerX},${layerY})`);
-    } catch (e) {
-      console.warn(`[compositeLayersOntoBase] Layer fehlgeschlagen: ${e.message}`);
-    }
-  }
-
-  if (!composites.length) return scaledBase;
-
-  const result = await sharp(scaledBase).composite(composites).jpeg({ quality: 100 }).toBuffer();
-  console.log(`[compositeLayersOntoBase] ${composites.length} Layer auf ${targetW}x${targetH} Base gerendert.`);
-  return result;
+  const dr = r1 - r2;
+  const dg = g1 - g2;
+  const db = b1 - b2;
+  return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
 // ============================================================================
@@ -276,6 +197,7 @@ async function compositeLayersOntoBase(baseBuffer, layerInfos = [], compositeBuf
 async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   const t0 = Date.now();
 
+  // Phase 0: JPG-Konvertierung — parallel
   [baseBuffer, compositeBuffer] = await Promise.all([
     sharp(baseBuffer).flatten({ background: { r: 255, g: 255, b: 255 } }).jpeg({ quality: 100 }).toBuffer(),
     sharp(compositeBuffer).flatten({ background: { r: 255, g: 255, b: 255 } }).jpeg({ quality: 100 }).toBuffer(),
@@ -283,8 +205,10 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
 
   const baseMeta = await sharp(baseBuffer).metadata();
   const compMeta = await sharp(compositeBuffer).metadata();
-  const width = baseMeta.width, height = baseMeta.height;
+  const width = baseMeta.width;
+  const height = baseMeta.height;
 
+  // Raw-Pixel parallel laden
   const [baseRaw, compRaw] = await Promise.all([
     sharp(baseBuffer).ensureAlpha().raw().toBuffer(),
     (async () => {
@@ -300,27 +224,37 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   const totalPixels = width * height;
   const outRaw = Buffer.alloc(totalPixels * 4);
 
+  // Phase 1: Diff-Map
   const diffMap = new Float32Array(totalPixels);
   for (let i = 0; i < totalPixels; i++) {
     const idx = i * 4;
-    diffMap[i] = colorDistance(baseRaw[idx], baseRaw[idx+1], baseRaw[idx+2], compRaw[idx], compRaw[idx+1], compRaw[idx+2]);
+    diffMap[i] = colorDistance(
+      baseRaw[idx], baseRaw[idx + 1], baseRaw[idx + 2],
+      compRaw[idx], compRaw[idx + 1], compRaw[idx + 2]
+    );
   }
 
+  // Phase 2: Alpha und Farbe rekonstruieren
   for (let i = 0; i < totalPixels; i++) {
     const idx = i * 4;
     const dist = diffMap[i];
+
     if (dist <= tolerance) {
       outRaw[idx] = 0; outRaw[idx+1] = 0; outRaw[idx+2] = 0; outRaw[idx+3] = 0;
     } else {
       const alpha = Math.min(1, (dist - tolerance) / (255 - tolerance));
       const bR = baseRaw[idx], bG = baseRaw[idx+1], bB = baseRaw[idx+2];
       const cR = compRaw[idx], cG = compRaw[idx+1], cB = compRaw[idx+2];
+
       let fR, fG, fB;
       if (alpha > 0.01) {
         fR = Math.round(Math.min(255, Math.max(0, (cR - (1-alpha)*bR) / alpha)));
         fG = Math.round(Math.min(255, Math.max(0, (cG - (1-alpha)*bG) / alpha)));
         fB = Math.round(Math.min(255, Math.max(0, (cB - (1-alpha)*bB) / alpha)));
-      } else { fR = cR; fG = cG; fB = cB; }
+      } else {
+        fR = cR; fG = cG; fB = cB;
+      }
+
       outRaw[idx] = fR; outRaw[idx+1] = fG; outRaw[idx+2] = fB;
       outRaw[idx+3] = Math.round(alpha * 255);
     }
@@ -329,6 +263,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   console.log(`[Timing] Phase 1+2 (Diff + Alpha): ${Date.now() - t1}ms`);
   const t2 = Date.now();
 
+  // Phase 3: Isolierte Rausch-Pixel entfernen
   const alphaChannel = new Uint8Array(totalPixels);
   for (let i = 0; i < totalPixels; i++) alphaChannel[i] = outRaw[i*4+3];
 
@@ -348,6 +283,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   console.log(`[Timing] Phase 3 (Rausch-Filter): ${Date.now() - t2}ms`);
   const t3 = Date.now();
 
+  // Phase 4: Connected-Component-Filter
   const visited = new Uint8Array(totalPixels);
   const components = [];
 
@@ -396,47 +332,81 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   console.log(`[Timing] Phase 4 (Connected Components): ${Date.now() - t3}ms`);
   const t4 = Date.now();
 
-  const proximityRadius = 70;
-  const mainMask = new Uint8Array(totalPixels);
-  if (components.length > 0) for (const pi of components[largestIdx].pixels) mainMask[pi] = 1;
+  // ============================================================================
+  // Phase 4.1: Proximity-Filter — DILATION MASK (pixelgenau + schnell)
+  //
+  // Problem mit Original:   für jeden Fremdpixel 32.400 Pixel scannen → langsam
+  // Problem mit Bbox-Fix:   T-Shirt-Umriss umschließt Design → Abstand = 0 → bleibt fälschlicherweise
+  //
+  // Diese Lösung baut einmalig eine "Dilation Mask":
+  //   Alle Pixel die innerhalb von 90px eines Haupt-Cluster-Pixels liegen werden markiert.
+  //   Danach: jede Fremdpixel-Prüfung = ein Array-Zugriff, O(1).
+  //
+  // Algorithmus (zwei Prefix-Summen-Pässe, O(width × height)):
+  //   Pass 1 horizontal: für jede Zeile, markiere alle Pixel ±90px von einem Haupt-Pixel
+  //   Pass 2 vertikal:   für jede Spalte, markiere alle Pixel ±90px von einem h-dilated Pixel
+  //   Ergebnis: quadratische Dilation, semantisch identisch zum Original (±90px in jede Richtung)
+  //
+  // T-Shirt-Umriss: seine Pixel liegen am Rand, weit vom Design → nicht in der Maske → entfernt ✓
+  // "EST.", "9990": nah am Design → in der Maske → bleiben ✓
+  // Laufzeit: ~490.000 Ops statt ~162.000.000 Ops beim Original → ~300× schneller
+  // ============================================================================
 
+  const proximityRadius = 90;
+
+  // Schritt 1: Binäre Maske der Haupt-Cluster-Pixel
+  const mainMask = new Uint8Array(totalPixels);
+  if (components.length > 0) {
+    for (const pi of components[largestIdx].pixels) mainMask[pi] = 1;
+  }
+
+  // Schritt 2: Horizontale Dilation via Prefix-Summen
   const hDilated = new Uint8Array(totalPixels);
   const rowPrefix = new Int32Array(width + 1);
   for (let y = 0; y < height; y++) {
     const rowBase = y * width;
     rowPrefix[0] = 0;
-    for (let x = 0; x < width; x++) rowPrefix[x+1] = rowPrefix[x] + mainMask[rowBase+x];
+    for (let x = 0; x < width; x++) {
+      rowPrefix[x + 1] = rowPrefix[x] + mainMask[rowBase + x];
+    }
     for (let x = 0; x < width; x++) {
       const lo = Math.max(0, x - proximityRadius);
-      const hi = Math.min(width-1, x + proximityRadius);
-      if (rowPrefix[hi+1] - rowPrefix[lo] > 0) hDilated[rowBase+x] = 1;
+      const hi = Math.min(width - 1, x + proximityRadius);
+      if (rowPrefix[hi + 1] - rowPrefix[lo] > 0) hDilated[rowBase + x] = 1;
     }
   }
 
+  // Schritt 3: Vertikale Dilation via Prefix-Summen
   const dilationMask = new Uint8Array(totalPixels);
   const colPrefix = new Int32Array(height + 1);
   for (let x = 0; x < width; x++) {
     colPrefix[0] = 0;
-    for (let y = 0; y < height; y++) colPrefix[y+1] = colPrefix[y] + hDilated[y*width+x];
+    for (let y = 0; y < height; y++) {
+      colPrefix[y + 1] = colPrefix[y] + hDilated[y * width + x];
+    }
     for (let y = 0; y < height; y++) {
       const lo = Math.max(0, y - proximityRadius);
-      const hi = Math.min(height-1, y + proximityRadius);
-      if (colPrefix[hi+1] - colPrefix[lo] > 0) dilationMask[y*width+x] = 1;
+      const hi = Math.min(height - 1, y + proximityRadius);
+      if (colPrefix[hi + 1] - colPrefix[lo] > 0) dilationMask[y * width + x] = 1;
     }
   }
 
-  for (let c=0; c<components.length; c++) {
+  // Schritt 4: Fremd-Cluster entfernen wenn keiner ihrer Pixel in der Maske liegt
+  for (let c = 0; c < components.length; c++) {
     if (c === largestIdx) continue;
     const comp = components[c];
     const isNearMain = comp.pixels.some(pi => dilationMask[pi] === 1);
     if (!isNearMain) {
-      for (const pi of comp.pixels) { outRaw[pi*4]=0; outRaw[pi*4+1]=0; outRaw[pi*4+2]=0; outRaw[pi*4+3]=0; }
+      for (const pi of comp.pixels) {
+        outRaw[pi*4] = 0; outRaw[pi*4+1] = 0; outRaw[pi*4+2] = 0; outRaw[pi*4+3] = 0;
+      }
     }
   }
 
   console.log(`[Timing] Phase 4.1 (Proximity Dilation Mask): ${Date.now() - t4}ms`);
   const t5 = Date.now();
 
+  // Phase 4.5: Restaurierungs-Pass
   const survivingMask = new Uint8Array(totalPixels);
   for (let i=0; i<totalPixels; i++) if (outRaw[i*4+3]>0) survivingMask[i]=1;
 
@@ -449,6 +419,7 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
     outRaw[idx]=compRaw[idx]; outRaw[idx+1]=compRaw[idx+1]; outRaw[idx+2]=compRaw[idx+2]; outRaw[idx+3]=255;
   }
 
+  // Phase 5: Auto-Crop
   let minX=width, minY=height, maxX=0, maxY=0;
   for (let y=0; y<height; y++) for (let x=0; x<width; x++) {
     if (outRaw[(y*width+x)*4+3]>0) {
@@ -458,11 +429,14 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
   }
 
   let result = sharp(outRaw, { raw: { width, height, channels: 4 } });
-  if (maxX>=minX && maxY>=minY) result = result.extract({ left:minX, top:minY, width:maxX-minX+1, height:maxY-minY+1 });
+  if (maxX>=minX && maxY>=minY) {
+    result = result.extract({ left:minX, top:minY, width:maxX-minX+1, height:maxY-minY+1 });
+  }
 
   const output = await result.png().toBuffer();
   console.log(`[Timing] Phase 4.5+5 (Restore + Crop): ${Date.now() - t5}ms`);
   console.log(`[Timing] GESAMT Extraktion: ${Date.now() - t0}ms`);
+
   return output;
 }
 
@@ -470,28 +444,35 @@ async function extractDesign(baseBuffer, compositeBuffer, tolerance = 10) {
 // PREVIEW-ERSTELLUNG (generisch)
 // ============================================================================
 
-async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerInfos = [], printX, printY, printW, printH }) {
+async function makePreview({
+  artworkUrl,
+  baseMockupUrl,
+  targetMockupUrl,
+  printX,
+  printY,
+  printW,
+  printH,
+}) {
   const t0 = Date.now();
 
+  // Alle 3 Bilder parallel laden
   const [artBuf, baseBuf, targetBuf] = await Promise.all([
     loadImage(artworkUrl),
     loadImage(baseMockupUrl),
     loadImage(targetMockupUrl),
   ]);
+
   console.log(`[Timing] Bildladung (parallel): ${Date.now() - t0}ms`);
 
-  // Layer mit exakter Position aus CSS-Werten auf die Basis compositen
-  const baseWithLayers = await compositeLayersOntoBase(baseBuf, layerInfos, artBuf);
-
-  const designCacheKey = `${artworkUrl}__${baseMockupUrl}__${layerInfos.map(l=>l.url).join(",")}`;
+  // Design extrahieren (mit Cache — gleiches Design wird nur 1x extrahiert)
+  const designCacheKey = `${artworkUrl}__${baseMockupUrl}`;
   let designTransparent;
-
   if (designCache.has(designCacheKey)) {
     console.log(`[Timing] Design aus Cache geladen`);
     designTransparent = designCache.get(designCacheKey);
   } else {
     try {
-      designTransparent = await extractDesign(baseWithLayers, artBuf, 10);
+      designTransparent = await extractDesign(baseBuf, artBuf, 10);
     } catch (err) {
       console.error("Design-Extraction Fehler, verwende Fallback:", err);
       designTransparent = await sharp(artBuf).ensureAlpha().png().toBuffer();
@@ -500,23 +481,29 @@ async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerIn
   }
 
   const t1 = Date.now();
+
+  // Ziel-Mockup Dimensionen lesen
   const targetSharp = sharp(targetBuf);
   const meta = await targetSharp.metadata();
   if (!meta.width || !meta.height) throw new Error("Konnte Ziel-Mockup-Größe nicht lesen.");
 
-  const areaPixelW = Math.round(meta.width  * printW);
+  // Design in die Druckfläche einpassen
+  const areaPixelW = Math.round(meta.width * printW);
   const areaPixelH = Math.round(meta.height * printH);
-  const areaLeft   = Math.round(meta.width  * printX);
-  const areaTop    = Math.round(meta.height * printY);
+  const areaLeft = Math.round(meta.width * printX);
+  const areaTop = Math.round(meta.height * printY);
 
   const scaled = await sharp(designTransparent)
     .resize(areaPixelW, areaPixelH, { fit: "inside", withoutEnlargement: false })
-    .png().toBuffer();
+    .png()
+    .toBuffer();
 
-  const scaledMeta   = await sharp(scaled).metadata();
+  const scaledMeta = await sharp(scaled).metadata();
   const centeredLeft = areaLeft + Math.round((areaPixelW - scaledMeta.width) / 2);
-  const freeSpaceV   = areaPixelH - scaledMeta.height;
-  const centeredTop  = freeSpaceV > 20 ? areaTop + Math.round(freeSpaceV * 0.3) : areaTop + Math.round(freeSpaceV / 2);
+  const freeSpaceV = areaPixelH - scaledMeta.height;
+  const centeredTop = freeSpaceV > 20
+    ? areaTop + Math.round(freeSpaceV * 0.3)
+    : areaTop + Math.round(freeSpaceV / 2);
 
   const finalBuf = await targetSharp
     .composite([{ input: scaled, left: centeredLeft, top: centeredTop }])
@@ -525,11 +512,15 @@ async function makePreview({ artworkUrl, baseMockupUrl, targetMockupUrl, layerIn
 
   console.log(`[Timing] Placement + Composite: ${Date.now() - t1}ms`);
   console.log(`[Timing] GESAMT makePreview: ${Date.now() - t0}ms`);
+
   return finalBuf;
 }
 
 // ============================================================================
 // SERVER START
 // ============================================================================
+
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => { console.log("Server läuft auf Port " + PORT); });
+app.listen(PORT, () => {
+  console.log("Server läuft auf Port " + PORT);
+});
